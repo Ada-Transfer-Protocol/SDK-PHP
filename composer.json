@@ -1,0 +1,32 @@
+{
+    "name": "adatp/php-sdk",
+    "description": "Ada Transport Protocol SDK for PHP and Laravel",
+    "type": "library",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "AdaTP\\": "src/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "AdaTP\\Providers\\AdaTPServiceProvider"
+            ],
+            "aliases": {
+                "AdaTP": "AdaTP\\Facades\\AdaTP"
+            }
+        }
+    },
+    "require": {
+        "php": ">=7.4",
+        "ext-sockets": "*",
+        "ext-openssl": "*",
+        "ext-sodium": "*",
+        "ext-json": "*",
+        "ramsey/uuid": "^4.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.0"
+    }
+}
