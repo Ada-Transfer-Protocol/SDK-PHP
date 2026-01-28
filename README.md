@@ -1,101 +1,86 @@
 # AdaTP PHP SDK
 
-A robust, spec-compliant PHP client for the Ada Transport Protocol (AdaTP). This SDK supports both Native PHP and Laravel frameworks, providing secure, encrypted communication with AdaTP servers.
+A modern, PSR-compliant PHP client library for the **Ada Transfer Protocol (AdaTP)**. This SDK provides easy-to-use abstractions for creating secure, real-time PHP applications (CLI tools, daemons, etc.).
 
-## Features
+## 📦 Features
+*   **Cryptography:** Uses `ext-openssl` for AES-256-GCM and X25519 key exchange.
+*   **Low-Level Socket Control:** Direct socket manipulation allowing for non-blocking I/O patterns.
+*   **Compatibility:** Works with PHP 8.0+.
 
-- **Secure Handshake**: Implements X25519 key exchange and HKDF key derivation (using `sodium` and `hash_hkdf`).
-- **End-to-End Encryption**: AES-256-GCM encryption for all messages.
-- **Laravel Integration**: Includes ServiceProvider, Facade, and Config publishing.
-- **Protocol Compliant**: Fully compatible with the official AdaTP Rust server.
+## 🚀 Installation
 
-## Requirements
-
-- PHP 7.4 or higher
-- `ext-sockets`
-- `ext-sodium`
-- `ext-openssl`
-- `ext-json`
-
-## Installation
+Ensure you have `composer` installed.
 
 ```bash
-composer require adatp/php-sdk
-# or locally
-composer config repositories.adatp path ./path/to/adatp/sdks/php
-composer require adatp/php-sdk @dev
+composer install
 ```
 
-## Usage
+**Requirements:**
+*   PHP 8.0+
+*   `ext-sockets`
+*   `ext-openssl`
 
-### Native PHP
+## 🛠️ Usage
+
+### 1. Basic Chat Client
 
 ```php
+<?php
 require 'vendor/autoload.php';
 
 use AdaTP\Client;
+use AdaTP\Protocol;
 
 try {
-    // Connect to server
-    $client = new Client('127.0.0.1', 8443);
-    $client->connect(); // Performs Handshake automatically
+    // 1. Initialize & Connect
+    $client = new Client('127.0.0.1', 8444);
+    $client->connect(); // Handshake
+
+    // 2. Authenticate
+    $client->authenticate("myuser", "mypass");
     
-    // Send secure message
+    // 3. Join Room
+    $client->joinRoom("general");
+
+    // 4. Send Message
     $client->sendTextMessage("Hello from PHP!");
-    
-    // Disconnect
-    $client->disconnect();
-    
+
+    // 5. Receive One Packet
+    $packet = $client->readPacket();
+    if ($packet->header->msgType === Protocol::MSG_TEXT_MESSAGE) {
+        $text = $client->decryptPacket($packet);
+        echo "Received: $text\n";
+    }
+
 } catch (Exception $e) {
     echo "Error: " . $e->getMessage();
 }
 ```
 
-### Laravel
+### 2. File Transfer
 
-1. **Register Service Provider** (if not auto-discovered):
-   Add to `config/app.php`:
-   ```php
-   AdaTP\Providers\AdaTPServiceProvider::class,
-   ```
+The SDK calculates all necessary headers and checksums for you.
 
-2. **Publish Config**:
-   ```bash
-   php artisan vendor:publish --tag=adatp-config
-   ```
-   Edit `config/adatp.php` to set your server host and port.
-
-3. **Use Facade**:
-   ```php
-   use AdaTP\Facades\AdaTP;
-
-   public function sendMessage() {
-       AdaTP::connect();
-       AdaTP::sendTextMessage("Hello from Laravel Controller!");
-       AdaTP::disconnect();
-   }
-   ```
-
-## Protocol Support
-
-| Feature | Status |
-|---------|--------|
-| Handshake (X25519) | ✅ |
-| Encryption (AES-GCM) | ✅ |
-| Text Messages | ✅ |
-| Multi-Room Chat | ✅ |
-| File Transfer | ✅ (Implemented) |
-| Voice/Video | 🚧 (Planned) |
-
-### Multi-Room Usage
-
+**Sending a File:**
 ```php
-// Join a specific room
-$client->joinRoom("devops");
-$client->sendTextMessage("Hello DevOps team!");
+$client->sendFile("/path/to/image.png");
 ```
 
-## License
+**Receiving:**
+As PHP is typically synchronous, handling file downloads usually requires a while-loop listening for `MSG_FILE_INIT`, `MSG_FILE_CHUNK`, and `MSG_FILE_COMPLETE`. 
 
-MIT
-# SDK-PHP
+See `filetransfer_example.php` for a robust implementation that saves incoming streams to disk.
+
+## 📂 Examples
+
+*   **Chat CLI:** `php chat-example.php`
+    *   An interactive CLI chat client. Uses `stream_select` to handle user input (STDIN) and network packets simultaneously without blocking.
+*   **File Transfer:** `php filetransfer_example.php`
+    *   Connects as a bot, sends a generated text file, and listens for incoming file transfers.
+
+## 🔧 Configuration
+
+The client constructor accepts the host IP and port:
+```php
+$client = new Client('192.168.1.5', 8444);
+```
