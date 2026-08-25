@@ -32,7 +32,10 @@ class Client
     /** SDK language (client-side metadata; the wire protocol is language-neutral). */
     private $locale = 'en';
 
-    public function __construct(string $hostOrUrl, int $port = 3000, string $path = '/ws', bool $secure = false, string $locale = 'en')
+    /** Pinned server Ed25519 identity (32 bytes) → enables the v2 handshake. */
+    private $pinnedServerKey = null;
+
+    public function __construct(string $hostOrUrl, int $port = 3000, string $path = '/ws', bool $secure = false, string $locale = 'en', $serverKey = null)
     {
         $this->locale = in_array($locale, self::LOCALES, true) ? $locale : 'en';
         if (strpos($hostOrUrl, 'ws://') === 0 || strpos($hostOrUrl, 'wss://') === 0) {
@@ -42,6 +45,11 @@ class Client
             $this->url = "$scheme://$hostOrUrl:$port$path";
         }
         $this->sessionId = \Ramsey\Uuid\Uuid::uuid4()->getBytes();
+        // Pinning the server key (hex or 32 raw bytes) switches connect() to the
+        // authenticated protocol v2 handshake.
+        if ($serverKey !== null) {
+            $this->pinnedServerKey = Crypto\HandshakeV2::normalizePinnedKey($serverKey);
+        }
     }
 
     /** Switches the SDK language at runtime (one of LOCALES). */
@@ -71,6 +79,12 @@ class Client
         $mySecret = sodium_crypto_box_secretkey($keypair);
         $myPublic = sodium_crypto_box_publickey($keypair);
 
+        // Authenticated v2 handshake when a server key is pinned.
+        if ($this->pinnedServerKey !== null) {
+            $this->handshakeV2($mySecret, $myPublic);
+            return;
+        }
+
         // 2. HANDSHAKE_INIT carries our public key
         $packet = new Packet(Protocol::MSG_HANDSHAKE_INIT, $myPublic, $this->sessionId);
         $this->sendPacket($packet);
@@ -95,6 +109,32 @@ class Client
 
         $this->sendPacket($completePacket);
         echo "Handshake complete.\n";
+    }
+
+    private function handshakeV2(string $mySecret, string $myPublic)
+    {
+        // 1. HANDSHAKE_INIT (version=2) carries our ephemeral public key.
+        $packet = new Packet(Protocol::MSG_HANDSHAKE_INIT, $myPublic, $this->sessionId);
+        $packet->header->version = Crypto\HandshakeV2::PROTOCOL_V2;
+        $this->sendPacket($packet);
+
+        // 2. HANDSHAKE_RESPONSE = epk_s || spk_s || sig; verify pin + signature
+        //    (throws AdaTPHandshakeException on failure) BEFORE deriving keys.
+        $response = $this->readPacketOfType([Protocol::MSG_HANDSHAKE_RESPONSE]);
+        list($epkS, $th) = Crypto\HandshakeV2::verifyServerHello(
+            $this->pinnedServerKey, $myPublic, $response->payload);
+
+        // 3. Derive the shared secret + keys only after verification (v2 = AAD-bound).
+        $sharedSecret = sodium_crypto_scalarmult($mySecret, $epkS);
+        $this->cryptoSession = new Crypto\SecureSession('client', $sharedSecret, true);
+
+        // 4. HANDSHAKE_COMPLETE: encrypted, header-AAD-bound Finished = label || th.
+        $this->sendEncryptedPacket(
+            Protocol::MSG_HANDSHAKE_COMPLETE,
+            Crypto\HandshakeV2::finishedPlaintext($th),
+            Crypto\HandshakeV2::PROTOCOL_V2
+        );
+        echo "v2 authenticated handshake complete (pinned key verified).\n";
     }
 
     public function authenticate(string $username, string $password): array
@@ -230,7 +270,8 @@ class Client
     public function decryptPacket(Packet $packet): string
     {
         if ($packet->header->flags & Protocol::FLAG_ENCRYPTED) {
-            return $this->cryptoSession->decrypt($packet->payload, $packet->authTag, $packet->header->sequence);
+            $aad = Packet::headerBytes($packet->header);
+            return $this->cryptoSession->decrypt($packet->payload, $packet->authTag, $packet->header->sequence, $aad);
         }
         return $packet->payload;
     }
@@ -275,11 +316,21 @@ class Client
     // Internals
     // ------------------------------------------------------------------
 
-    private function sendEncryptedPacket(int $type, string $payload)
+    private function sendEncryptedPacket(int $type, string $payload, int $version = 1)
     {
-        $enc = $this->cryptoSession->encrypt($payload);
-        $packet = new Packet($type, $enc['ciphertext'], $this->sessionId);
+        // Build the header first so a v2 session can bind it as AEAD AAD. For GCM
+        // the ciphertext length equals the plaintext length, so the header is
+        // final before encryption (only the sequence is echoed back).
+        $packet = new Packet($type, '', $this->sessionId);
+        $packet->header->version = $version;
         $packet->header->flags |= Protocol::FLAG_ENCRYPTED;
+        $packet->header->length = strlen($payload);
+        $packet->header->sequence = $this->cryptoSession->getMySequence();
+
+        $aad = Packet::headerBytes($packet->header);
+        $enc = $this->cryptoSession->encrypt($payload, $aad);
+
+        $packet->payload = $enc['ciphertext'];
         $packet->header->sequence = $enc['sequence'];
         $packet->authTag = $enc['tag'];
         $this->sendPacket($packet);

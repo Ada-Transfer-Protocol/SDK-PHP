@@ -23,38 +23,36 @@ class Packet
         $this->authTag = null;
     }
 
+    /**
+     * The 45-byte header, serialized as on the wire. Also used as the AEAD AAD
+     * in protocol v2, so it must match the server's PacketHeader::header_bytes()
+     * byte-for-byte.
+     */
+    public static function headerBytes(PacketHeader $h): string
+    {
+        $sessId = $h->sessionId;
+        if (strlen($sessId) !== 16) {
+            $sessId = str_repeat("\0", 16);
+        }
+        return pack('V', $h->magic)         // magic (4) LE
+             . pack('C', $h->version)       // version (1)
+             . pack('v', $h->flags)         // flags (2) LE
+             . pack('V', $h->length)        // length (4) LE
+             . pack('P', $h->sequence)      // sequence (8) LE
+             . pack('v', $h->msgType)       // msgType (2) LE
+             . pack('P', $h->timestamp)     // timestamp (8) LE
+             . $sessId;                      // sessionId (16)
+    }
+
     public static function encode(Packet $packet): string
     {
-        // Magic (4) LE
-        $bin = pack('V', $packet->header->magic);
-        // Version (1)
-        $bin .= pack('C', $packet->header->version);
-        // Flags (2) LE
-        $bin .= pack('v', $packet->header->flags);
-        // Length (4) LE
-        $bin .= pack('V', strlen($packet->payload)); // Update length dynamically
-        // Sequence (8) LE (64-bit)
-        $bin .= pack('P', $packet->header->sequence);
-        // MsgType (2) LE
-        $bin .= pack('v', $packet->header->msgType);
-        // Timestamp (8) LE
-        $bin .= pack('P', $packet->header->timestamp);
-        // SessionID (16) raw bytes
-        // Ensure session ID is 16 bytes
-        $sessId = $packet->header->sessionId;
-        if (strlen($sessId) !== 16) {
-             $sessId = str_repeat("\0", 16);
-        }
-        $bin .= $sessId;
-
-        // Payload
+        // Length is the payload length on the wire.
+        $packet->header->length = strlen($packet->payload);
+        $bin = self::headerBytes($packet->header);
         $bin .= $packet->payload;
-
-        // Auth Tag
         if ($packet->authTag !== null) {
             $bin .= $packet->authTag;
         }
-
         return $bin;
     }
 
