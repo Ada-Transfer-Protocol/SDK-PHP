@@ -4,7 +4,7 @@ A modern, PSR-compliant PHP client library for the **Ada Transfer Protocol (AdaT
 
 ## 📦 Features
 *   **Cryptography:** Uses `ext-openssl` for AES-256-GCM and X25519 key exchange.
-*   **Low-Level Socket Control:** Direct socket manipulation allowing for non-blocking I/O patterns.
+*   **WebSocket Transport:** Dependency-free RFC 6455 client built on PHP streams (ws:// and wss://).
 *   **Compatibility:** Works with PHP 8.0+.
 
 ## 🚀 Installation
@@ -17,7 +17,7 @@ composer install
 
 **Requirements:**
 *   PHP 8.0+
-*   `ext-sockets`
+
 *   `ext-openssl`
 
 ## 🛠️ Usage
@@ -33,7 +33,7 @@ use AdaTP\Protocol;
 
 try {
     // 1. Initialize & Connect
-    $client = new Client('127.0.0.1', 8444);
+    $client = new Client('127.0.0.1', 3000);
     $client->connect(); // Handshake
 
     // 2. Authenticate
@@ -82,5 +82,5 @@ See `filetransfer_example.php` for a robust implementation that saves incoming s
 
 The client constructor accepts the host IP and port:
 ```php
-$client = new Client('192.168.1.5', 8444);
+$client = new Client('192.168.1.5', 3000);
 ```
