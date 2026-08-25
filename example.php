@@ -7,7 +7,7 @@ use AdaTP\Client;
 echo "Starting AdaTP PHP Client...\n";
 
 try {
-    $client = new Client('127.0.0.1', 8443);
+    $client = new Client('127.0.0.1', 3000);
     
     echo "Connecting...\n";
     $client->connect();

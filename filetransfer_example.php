@@ -19,7 +19,7 @@ $uploadFile = __DIR__ . '/upload_test_php.txt';
 file_put_contents($uploadFile, str_repeat("PHP File Transfer Test\n", 50));
 
 try {
-    $client = new Client('127.0.0.1', 8444);
+    $client = new Client('127.0.0.1', 3000);
     $client->connect();
     $client->authenticate('phpbot', 'secret_password');
     

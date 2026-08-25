@@ -20,7 +20,6 @@
     },
     "require": {
         "php": ">=7.4",
-        "ext-sockets": "*",
         "ext-openssl": "*",
         "ext-sodium": "*",
         "ext-json": "*",

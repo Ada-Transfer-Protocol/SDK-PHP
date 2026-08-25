@@ -26,6 +26,18 @@ class Protocol
     const MSG_FILE_COMPLETE = 0x0033;
     const MSG_FILE_CANCEL = 0x0034;
     
+    // Game state
+    const MSG_GAME_STATE = 0x0050;
+
+    // Tools
+    const MSG_TOOL_CALL = 0x0070;
+    const MSG_TOOL_RESULT = 0x0071;
+    const MSG_TOOL_ERROR = 0x0072;
+
+    // System
+    const MSG_PING = 0x0080;
+    const MSG_PONG = 0x0081;
+
     // Rooms
     const MSG_JOIN_ROOM = 0x00A0;
     const MSG_ROOM_JOINED = 0x00A1; // Not yet used by server but good to have
