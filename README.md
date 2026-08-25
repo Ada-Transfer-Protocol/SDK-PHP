@@ -84,3 +84,14 @@ The client constructor accepts the host IP and port:
 ```php
 $client = new Client('192.168.1.5', 3000);
 ```
+
+## Language / locale
+
+The client takes a `$locale` constructor argument for its user-facing
+strings (client-side metadata — the wire protocol is language-neutral).
+Default `en`; supported: `en tr it fr de zh ja hi ar`.
+
+```php
+$client = new Client('127.0.0.1', 3000, '/ws', false, 'tr');
+$client->setLocale('de'); // switch at runtime
+```

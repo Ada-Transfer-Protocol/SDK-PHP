@@ -19,6 +19,9 @@ namespace AdaTP;
  */
 class Client
 {
+    /** Locales supported by the SDK's language option. */
+    public const LOCALES = ['en', 'tr', 'it', 'fr', 'de', 'zh', 'ja', 'hi', 'ar'];
+
     private $url;
     private $transport;
 
@@ -26,8 +29,12 @@ class Client
     private $sessionId;
     private $inbox = [];
 
-    public function __construct(string $hostOrUrl, int $port = 3000, string $path = '/ws', bool $secure = false)
+    /** SDK language (client-side metadata; the wire protocol is language-neutral). */
+    private $locale = 'en';
+
+    public function __construct(string $hostOrUrl, int $port = 3000, string $path = '/ws', bool $secure = false, string $locale = 'en')
     {
+        $this->locale = in_array($locale, self::LOCALES, true) ? $locale : 'en';
         if (strpos($hostOrUrl, 'ws://') === 0 || strpos($hostOrUrl, 'wss://') === 0) {
             $this->url = $hostOrUrl;
         } else {
@@ -35,6 +42,17 @@ class Client
             $this->url = "$scheme://$hostOrUrl:$port$path";
         }
         $this->sessionId = \Ramsey\Uuid\Uuid::uuid4()->getBytes();
+    }
+
+    /** Switches the SDK language at runtime (one of LOCALES). */
+    public function setLocale(string $locale): void
+    {
+        $this->locale = in_array($locale, self::LOCALES, true) ? $locale : 'en';
+    }
+
+    public function getLocale(): string
+    {
+        return $this->locale;
     }
 
     public function connect()
