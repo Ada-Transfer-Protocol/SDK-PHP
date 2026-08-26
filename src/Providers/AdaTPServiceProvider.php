@@ -12,7 +12,7 @@ class AdaTPServiceProvider extends ServiceProvider
         $this->app->singleton('adatp', function ($app) {
             $config = $app['config']['adatp'] ?? [];
             $host = $config['host'] ?? '127.0.0.1';
-            $port = $config['port'] ?? 8443;
+            $port = $config['port'] ?? 3000;
             
             return new Client($host, $port);
         });

@@ -29,8 +29,8 @@ if (empty($password)) $password = "secret_password";
 
 try {
     // 2. Connect
-    echo "Connecting to localhost:8444...\n";
-    $client = new Client('127.0.0.1', 8444);
+    echo "Connecting to localhost:3000...\n";
+    $client = new Client('127.0.0.1', 3000);
     $client->connect(); // Handshake
     
     echo "Authenticating...\n";
@@ -39,12 +39,9 @@ try {
     echo "Joined chat as '$username'. Type messages and press Enter.\n";
     echo "Type '/quit' to exit.\n\n";
 
-    // Prepare for loop
-    $socket = $client->getSocket();
-    
-    // Set socket to non-blocking so we can interleave with STDIN
-    socket_set_nonblock($socket);
-    stream_set_blocking(STDIN, 0);
+    // Prepare for loop (stream-based since the transport is WebSocket)
+    $stream = $client->getSocket();
+    stream_set_blocking(STDIN, false);
 
     // Initial Join Message
     // In a real app we might use PRESENCE_UPDATE or just text
@@ -74,34 +71,18 @@ try {
                 
                 // Format: [Username] Message
                 $msg = "[$username] $line";
-                
-                // Must temporarily set blocking for send to ensure full write? 
-                // sendTextMessage calls sendPacket calls socket_write which blocks usually.
-                // But we set socket to nonblock. socket_write might return partial or EAGAIN.
-                // Our simple SDK assumes blocking writes. Let's toggle or handle retry.
-                // For this example, let's assume small payload fits in buffer.
-                socket_set_block($socket);
                 $client->sendTextMessage($msg);
-                socket_set_nonblock($socket);
-                
-                // Move cursor up logic? Or just print "Sent"
-                // echo "\033[1A"; // Ansi up
             }
         }
 
-        // --- 2. Handle Socket (Incoming Messages) ---
-        $readSocks = [$socket];
+        // --- 2. Handle WebSocket (Incoming Messages) ---
+        $readSocks = [$stream];
         $writeSocks = $exceptSocks = null;
-        
-        // socket_select for ext-sockets
-        if (socket_select($readSocks, $writeSocks, $exceptSocks, 0, 10000) > 0) {
-            // Data available!
-            // We need to read packet.
-            // Be careful because readPacket in Client.php is designed for Blocking IO.
-            // calling it on non-blocking socket might assume full header is there but it might not be.
-            
-            // Hack for demo: Temporarily set blocking to read one full packet reliably
-            socket_set_block($socket);
+
+        // hasPending() covers packets the transport already buffered,
+        // which stream_select() cannot see.
+        if ($client->hasPending() ||
+            stream_select($readSocks, $writeSocks, $exceptSocks, 0, 10000) > 0) {
             try {
                 $pkt = $client->readPacket();
                 
@@ -122,7 +103,6 @@ try {
                 echo "Socket Error: " . $e->getMessage() . "\n";
                 break;
             }
-            socket_set_nonblock($socket);
         }
         
         // Wait a tiny bit (10ms) to reduce CPU usage

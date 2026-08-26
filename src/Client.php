@@ -2,202 +2,250 @@
 
 namespace AdaTP;
 
+/**
+ * AdaTP client for PHP.
+ *
+ * Transport is WebSocket (binary frames, one AdaTP packet per message).
+ * connect() performs the X25519 handshake (libsodium) so all subsequent
+ * traffic is encrypted with AES-256-GCM.
+ *
+ *     $client = new Client('127.0.0.1', 3000);
+ *     $client->connect();
+ *     $client->authenticate('user1', 'password123');
+ *     $client->joinRoom('lobby');
+ *     $client->sendTextMessage('Hello!');
+ *
+ * A full URL is also accepted: new Client('wss://example.com/ws')
+ */
 class Client
 {
-    private $host;
-    private $port;
-    private $socket;
-    
+    /** Locales supported by the SDK's language option. */
+    public const LOCALES = ['en', 'tr', 'it', 'fr', 'de', 'zh', 'ja', 'hi', 'ar'];
+
+    private $url;
+    private $transport;
+
     public $cryptoSession;
     private $sessionId;
+    private $inbox = [];
 
-    public function __construct(string $host, int $port)
+    /** SDK language (client-side metadata; the wire protocol is language-neutral). */
+    private $locale = 'en';
+
+    /** Pinned server Ed25519 identity (32 bytes) → enables the v2 handshake. */
+    private $pinnedServerKey = null;
+
+    public function __construct(string $hostOrUrl, int $port = 3000, string $path = '/ws', bool $secure = false, string $locale = 'en', $serverKey = null)
     {
-        $this->host = $host;
-        $this->port = $port;
-        // Generate a random session ID
+        $this->locale = in_array($locale, self::LOCALES, true) ? $locale : 'en';
+        if (strpos($hostOrUrl, 'ws://') === 0 || strpos($hostOrUrl, 'wss://') === 0) {
+            $this->url = $hostOrUrl;
+        } else {
+            $scheme = $secure ? 'wss' : 'ws';
+            $this->url = "$scheme://$hostOrUrl:$port$path";
+        }
         $this->sessionId = \Ramsey\Uuid\Uuid::uuid4()->getBytes();
+        // Pinning the server key (hex or 32 raw bytes) switches connect() to the
+        // authenticated protocol v2 handshake.
+        if ($serverKey !== null) {
+            $this->pinnedServerKey = Crypto\HandshakeV2::normalizePinnedKey($serverKey);
+        }
+    }
+
+    /** Switches the SDK language at runtime (one of LOCALES). */
+    public function setLocale(string $locale): void
+    {
+        $this->locale = in_array($locale, self::LOCALES, true) ? $locale : 'en';
+    }
+
+    public function getLocale(): string
+    {
+        return $this->locale;
     }
 
     public function connect()
     {
-        $this->socket = socket_create(AF_INET, SOCK_STREAM, SOL_TCP);
-        if ($this->socket === false) {
-            throw new \Exception("socket_create() failed: " . socket_strerror(socket_last_error()));
-        }
+        $this->transport = new WebSocketTransport();
+        $this->transport->connect($this->url);
 
-        $result = socket_connect($this->socket, $this->host, $this->port);
-        if ($result === false) {
-            throw new \Exception("socket_connect() failed: " . socket_strerror(socket_last_error($this->socket)));
-        }
-
-        echo "Connected. Starting handshake...\n";
+        echo "Connected to {$this->url}. Starting handshake...\n";
         $this->handshake();
     }
 
     private function handshake()
     {
-        // 1. Generate Ephemeral Keys (X25519)
-        // sodium_crypto_box_keypair generates 32-byte secret + 32-byte public
+        // 1. Ephemeral X25519 key pair
         $keypair = sodium_crypto_box_keypair();
         $mySecret = sodium_crypto_box_secretkey($keypair);
         $myPublic = sodium_crypto_box_publickey($keypair);
 
-        // 2. Send HANDSHAKE_INIT
+        // Authenticated v2 handshake when a server key is pinned.
+        if ($this->pinnedServerKey !== null) {
+            $this->handshakeV2($mySecret, $myPublic);
+            return;
+        }
+
+        // 2. HANDSHAKE_INIT carries our public key
         $packet = new Packet(Protocol::MSG_HANDSHAKE_INIT, $myPublic, $this->sessionId);
         $this->sendPacket($packet);
 
-        // 3. Receive HANDSHAKE_RESPONSE
-        $response = $this->readPacket();
-        if ($response->header->msgType !== Protocol::MSG_HANDSHAKE_RESPONSE) {
-            throw new \Exception("Expected HANDSHAKE_RESPONSE, got " . $response->header->msgType);
+        // 3. HANDSHAKE_RESPONSE carries the server's public key
+        $response = $this->readPacketOfType([Protocol::MSG_HANDSHAKE_RESPONSE]);
+        $serverPublic = substr($response->payload, 0, 32);
+        if (strlen($serverPublic) < 32) {
+            throw new \Exception("Server did not provide a key");
         }
 
-        $serverPublic = substr($response->payload, 0, 32);
-
-        // 4. Compute Shared Secret
+        // 4. Shared secret + session keys
         $sharedSecret = sodium_crypto_scalarmult($mySecret, $serverPublic);
-
-        // 5. Init Crypto Session
         $this->cryptoSession = new Crypto\SecureSession('client', $sharedSecret);
 
-        // 6. Send HANDSHAKE_COMPLETE (Encrypted)
-        $verifyMsg = "Verification OK";
-        $encrypted = $this->cryptoSession->encrypt($verifyMsg);
-
+        // 5. HANDSHAKE_COMPLETE proves both sides derived the same keys
+        $encrypted = $this->cryptoSession->encrypt("Verification OK");
         $completePacket = new Packet(Protocol::MSG_HANDSHAKE_COMPLETE, $encrypted['ciphertext'], $this->sessionId);
         $completePacket->header->flags |= Protocol::FLAG_ENCRYPTED;
         $completePacket->header->sequence = $encrypted['sequence'];
         $completePacket->authTag = $encrypted['tag'];
 
         $this->sendPacket($completePacket);
-        echo "Handshake Complete!\n";
+        echo "Handshake complete.\n";
     }
 
-    public function decryptPacket(Packet $packet): string
+    private function handshakeV2(string $mySecret, string $myPublic)
     {
-        if ($packet->header->flags & Protocol::FLAG_ENCRYPTED) {
-            return $this->cryptoSession->decrypt($packet->payload, $packet->authTag, $packet->header->sequence);
+        // 1. HANDSHAKE_INIT (version=2) carries our ephemeral public key.
+        $packet = new Packet(Protocol::MSG_HANDSHAKE_INIT, $myPublic, $this->sessionId);
+        $packet->header->version = Crypto\HandshakeV2::PROTOCOL_V2;
+        $this->sendPacket($packet);
+
+        // 2. HANDSHAKE_RESPONSE = epk_s || spk_s || sig; verify pin + signature
+        //    (throws AdaTPHandshakeException on failure) BEFORE deriving keys.
+        $response = $this->readPacketOfType([Protocol::MSG_HANDSHAKE_RESPONSE]);
+        list($epkS, $th) = Crypto\HandshakeV2::verifyServerHello(
+            $this->pinnedServerKey, $myPublic, $response->payload);
+
+        // 3. Derive the shared secret + keys only after verification (v2 = AAD-bound).
+        $sharedSecret = sodium_crypto_scalarmult($mySecret, $epkS);
+        $this->cryptoSession = new Crypto\SecureSession('client', $sharedSecret, true);
+
+        // 4. HANDSHAKE_COMPLETE: encrypted, header-AAD-bound Finished = label || th.
+        $this->sendEncryptedPacket(
+            Protocol::MSG_HANDSHAKE_COMPLETE,
+            Crypto\HandshakeV2::finishedPlaintext($th),
+            Crypto\HandshakeV2::PROTOCOL_V2
+        );
+        echo "v2 authenticated handshake complete (pinned key verified).\n";
+    }
+
+    public function authenticate(string $username, string $password): array
+    {
+        return $this->doAuth(['username' => $username, 'password' => $password]);
+    }
+
+    /**
+     * Authenticate with a single credential string (token/session/API key)
+     * instead of username+password — for servers whose auth mode expects an
+     * auth_string (file-driver token, external webhook, etc.).
+     */
+    public function authenticateWithString(string $authString): array
+    {
+        return $this->doAuth(['auth_string' => $authString]);
+    }
+
+    private function doAuth(array $body): array
+    {
+        if (!$this->cryptoSession) {
+            throw new \Exception("No secure session (call connect() first)");
         }
-        return $packet->payload;
+
+        $payload = json_encode($body);
+        $this->sendEncryptedPacket(Protocol::MSG_AUTH_REQUEST, $payload);
+
+        $response = $this->readPacketOfType([Protocol::MSG_AUTH_SUCCESS, Protocol::MSG_AUTH_FAILURE]);
+        $decrypted = $this->decryptPacket($response);
+
+        if ($response->header->msgType === Protocol::MSG_AUTH_SUCCESS) {
+            $identity = json_decode($decrypted, true);
+            echo "Auth success: $decrypted\n";
+            return is_array($identity) ? $identity : [];
+        }
+        throw new \Exception("Auth failed: $decrypted");
+    }
+
+    /** Joins a room and blocks until the server confirms with ROOM_JOINED. */
+    public function joinRoom(string $roomName): string
+    {
+        if (!$this->cryptoSession) {
+            throw new \Exception("No secure session.");
+        }
+
+        $this->sendEncryptedPacket(Protocol::MSG_JOIN_ROOM, $roomName);
+        $response = $this->readPacketOfType([Protocol::MSG_ROOM_JOINED, Protocol::MSG_AUTH_FAILURE]);
+        $decrypted = $this->decryptPacket($response);
+        if ($response->header->msgType !== Protocol::MSG_ROOM_JOINED) {
+            throw new \Exception("Join failed: $decrypted");
+        }
+        return $decrypted;
     }
 
     public function sendTextMessage(string $text)
     {
         if (!$this->cryptoSession) {
-             throw new \Exception("No secure session.");
+            throw new \Exception("No secure session.");
         }
-
-        $encrypted = $this->cryptoSession->encrypt($text);
-        
-        $packet = new Packet(Protocol::MSG_TEXT_MESSAGE, $encrypted['ciphertext'], $this->sessionId);
-        $packet->header->flags |= Protocol::FLAG_ENCRYPTED;
-        $packet->header->sequence = $encrypted['sequence'];
-        $packet->authTag = $encrypted['tag'];
-        
-        $this->sendPacket($packet);
-    }
-    
-    public function joinRoom(string $roomName)
-    {
-        if (!$this->cryptoSession) {
-             throw new \Exception("No secure session.");
-        }
-
-        $encrypted = $this->cryptoSession->encrypt($roomName);
-        
-        $packet = new Packet(Protocol::MSG_JOIN_ROOM, $encrypted['ciphertext'], $this->sessionId);
-        $packet->header->flags |= Protocol::FLAG_ENCRYPTED;
-        $packet->header->sequence = $encrypted['sequence'];
-        $packet->authTag = $encrypted['tag'];
-        
-        $this->sendPacket($packet);
+        $this->sendEncryptedPacket(Protocol::MSG_TEXT_MESSAGE, $text);
     }
 
-    public function disconnect()
+    /** Blocks until the next TEXT_MESSAGE arrives; returns the plaintext. */
+    public function readTextMessage(): string
     {
-        $packet = new Packet(Protocol::MSG_DISCONNECT, "", $this->sessionId);
-        $this->sendPacket($packet);
-        if ($this->socket) {
-            socket_close($this->socket);
-        }
+        $packet = $this->readPacketOfType([Protocol::MSG_TEXT_MESSAGE]);
+        return $this->decryptPacket($packet);
     }
 
-    private function sendPacket(Packet $packet)
+    /** Broadcasts a game state (array → JSON, or raw string) to the room. */
+    public function sendGameState($state)
     {
-        // echo "[DEBUG] Sending Packet Type: " . dechex($packet->header->msgType) . "\n";
-        $bin = Packet::encode($packet);
-        socket_write($this->socket, $bin, strlen($bin));
+        $payload = is_string($state) ? $state : json_encode($state);
+        $this->sendEncryptedPacket(Protocol::MSG_GAME_STATE, $payload);
     }
 
-    public function readPacket(): Packet
+    /** Blocks until the next GAME_STATE arrives; returns array (or string). */
+    public function readGameState()
     {
-        // Read Header (45 bytes)
-        $headerBin = socket_read($this->socket, 45);
-        if ($headerBin === false || strlen($headerBin) < 45) {
-            throw new \Exception("Failed to read header");
-        }
-        
-        // Peek length (offset 7, 4 bytes, V = uint32 LE)
-        $length = unpack('V', substr($headerBin, 7, 4))[1];
-        
-        // Peek flags (offset 5, 2 bytes, v = uint16 LE)
-        $flags = unpack('v', substr($headerBin, 5, 2))[1];
-        
-        $extra = ($flags & Protocol::FLAG_ENCRYPTED) ? 16 : 0;
-        $totalToRead = $length + $extra;
-        
-        $payloadBin = "";
-        if ($totalToRead > 0) {
-            $payloadBin = socket_read($this->socket, $totalToRead);
-            if (strlen($payloadBin) < $totalToRead) {
-                 throw new \Exception("Incomplete payload");
+        $packet = $this->readPacketOfType([Protocol::MSG_GAME_STATE]);
+        $raw = $this->decryptPacket($packet);
+        $decoded = json_decode($raw, true);
+        return $decoded !== null ? $decoded : $raw;
+    }
+
+    /** Calls a server-side tool; returns the result or throws on error. */
+    public function callTool(string $tool, array $args = [])
+    {
+        $callId = \Ramsey\Uuid\Uuid::uuid4()->toString();
+        $body = json_encode(['id' => $callId, 'tool' => $tool, 'args' => (object)$args]);
+        $this->sendEncryptedPacket(Protocol::MSG_TOOL_CALL, $body);
+
+        for ($i = 0; $i < 256; $i++) {
+            $packet = $this->readPacketOfType([Protocol::MSG_TOOL_RESULT, Protocol::MSG_TOOL_ERROR]);
+            $parsed = json_decode($this->decryptPacket($packet), true);
+            if (($parsed['id'] ?? null) !== $callId) {
+                continue;
             }
-        }
-        
-        return Packet::decode($headerBin . $payloadBin);
-    }
-
-    public function getSocket()
-    {
-        return $this->socket;
-    }
-
-    public function authenticate(string $username, string $password)
-    {
-        if (!$this->cryptoSession) {
-            throw new \Exception("No secure session");
-        }
-
-        $payload = json_encode(['username' => $username, 'password' => $password]);
-        $enc = $this->cryptoSession->encrypt($payload);
-
-        $packet = new Packet(Protocol::MSG_AUTH_REQUEST, $enc['ciphertext'], $this->sessionId);
-        $packet->header->flags |= Protocol::FLAG_ENCRYPTED;
-        $packet->header->sequence = $enc['sequence'];
-        $packet->authTag = $enc['tag'];
-
-        $this->sendPacket($packet);
-
-        // Wait for response
-        $response = $this->readPacket();
-        
-        if (($response->header->flags & Protocol::FLAG_ENCRYPTED) && $this->cryptoSession) {
-            $decrypted = $this->decryptPacket($response);
-            
-            if ($response->header->msgType === Protocol::MSG_AUTH_SUCCESS) {
-                echo "Auth Success: " . $decrypted . "\n";
-                return;
-            } else if ($response->header->msgType === Protocol::MSG_AUTH_FAILURE) {
-                throw new \Exception("Auth Failed: " . $decrypted);
+            if ($packet->header->msgType === Protocol::MSG_TOOL_RESULT && ($parsed['ok'] ?? false)) {
+                return $parsed['result'] ?? null;
             }
+            $err = $parsed['error'] ?? ['code' => 'tool_failed', 'message' => 'unknown'];
+            throw new \Exception("Tool '$tool' failed: {$err['code']}: {$err['message']}");
         }
-        
-        if ($response->header->msgType === Protocol::MSG_AUTH_FAILURE) {
-             throw new \Exception("Auth Failed");
-        }
+        throw new \Exception("No response for tool '$tool'");
+    }
 
-        throw new \Exception("Unexpected packet during auth: " . $response->header->msgType);
+    /** Lists the tools available on the server. */
+    public function listTools(): array
+    {
+        $result = $this->callTool('system.list_tools');
+        return $result['tools'] ?? [];
     }
 
     public function sendFile(string $filePath)
@@ -205,57 +253,143 @@ class Client
         if (!file_exists($filePath)) {
             throw new \Exception("File not found: $filePath");
         }
-        
+
         $filename = basename($filePath);
         $size = filesize($filePath);
         $fileId = \Ramsey\Uuid\Uuid::uuid4()->toString();
         $fileIdBytes = \Ramsey\Uuid\Uuid::fromString($fileId)->getBytes();
-        
-        // Init
+
         $initData = json_encode([
             'id' => $fileId,
             'filename' => $filename,
             'size' => $size
         ]);
         $this->sendEncryptedPacket(Protocol::MSG_FILE_INIT, $initData);
-        
+
         echo "Sending file $filename ($size bytes)...\n";
-        
-        // Chunks
+
         $handle = fopen($filePath, "rb");
         if ($handle === false) throw new \Exception("Cannot open file");
-        
+
         while (!feof($handle)) {
             $chunk = fread($handle, 16384);
             if ($chunk === false || strlen($chunk) === 0) break;
-            
-            $payload = $fileIdBytes . $chunk;
-            $this->sendEncryptedPacket(Protocol::MSG_FILE_CHUNK, $payload);
+            $this->sendEncryptedPacket(Protocol::MSG_FILE_CHUNK, $fileIdBytes . $chunk);
         }
         fclose($handle);
-        
-        // Complete
+
         $this->sendEncryptedPacket(Protocol::MSG_FILE_COMPLETE, $fileIdBytes);
         echo "File sent.\n";
     }
 
-    private function sendEncryptedPacket(int $type, string $payload)
+    public function decryptPacket(Packet $packet): string
     {
-        if (!$this->cryptoSession) return;
-        
-        $enc = $this->cryptoSession->encrypt($payload);
-        $packet = new Packet($type, $enc['ciphertext'], $this->sessionId);
-        $packet->header->flags |= Protocol::FLAG_ENCRYPTED;
-        $packet->header->sequence = $enc['sequence'];
-        $packet->authTag = $enc['tag'];
-        
-        $this->sendPacket($packet);
+        if ($packet->header->flags & Protocol::FLAG_ENCRYPTED) {
+            $aad = Packet::headerBytes($packet->header);
+            return $this->cryptoSession->decrypt($packet->payload, $packet->authTag, $packet->header->sequence, $aad);
+        }
+        return $packet->payload;
+    }
+
+    public function disconnect()
+    {
+        if ($this->transport && $this->transport->isConnected()) {
+            try {
+                $packet = new Packet(Protocol::MSG_DISCONNECT, "", $this->sessionId);
+                $this->sendPacket($packet);
+            } catch (\Exception $e) {
+                // best effort
+            }
+            $this->transport->close();
+        }
     }
 
     public function close()
     {
-        if ($this->socket) {
-            socket_close($this->socket);
+        if ($this->transport) {
+            $this->transport->close();
+        }
+    }
+
+    /**
+     * Underlying PHP stream — usable with stream_select() for event loops.
+     * Note: check hasPending() first; buffered packets are invisible to
+     * stream_select().
+     */
+    public function getSocket()
+    {
+        return $this->transport ? $this->transport->getStream() : null;
+    }
+
+    /** True if a packet can be read without touching the network. */
+    public function hasPending(): bool
+    {
+        return !empty($this->inbox) || ($this->transport && $this->transport->hasBuffered());
+    }
+
+    // ------------------------------------------------------------------
+    // Internals
+    // ------------------------------------------------------------------
+
+    private function sendEncryptedPacket(int $type, string $payload, int $version = 1)
+    {
+        // Build the header first so a v2 session can bind it as AEAD AAD. For GCM
+        // the ciphertext length equals the plaintext length, so the header is
+        // final before encryption (only the sequence is echoed back).
+        $packet = new Packet($type, '', $this->sessionId);
+        $packet->header->version = $version;
+        $packet->header->flags |= Protocol::FLAG_ENCRYPTED;
+        $packet->header->length = strlen($payload);
+        $packet->header->sequence = $this->cryptoSession->getMySequence();
+
+        $aad = Packet::headerBytes($packet->header);
+        $enc = $this->cryptoSession->encrypt($payload, $aad);
+
+        $packet->payload = $enc['ciphertext'];
+        $packet->header->sequence = $enc['sequence'];
+        $packet->authTag = $enc['tag'];
+        $this->sendPacket($packet);
+    }
+
+    private function sendPacket(Packet $packet)
+    {
+        $this->transport->sendBinary(Packet::encode($packet));
+    }
+
+    /** Returns the next packet (queued packets first, then the wire). */
+    public function readPacket(): Packet
+    {
+        if (!empty($this->inbox)) {
+            return array_shift($this->inbox);
+        }
+        $frame = $this->transport->recvBinary();
+        if ($frame === null) {
+            throw new \Exception("Connection closed");
+        }
+        if (strlen($frame) < Protocol::HEADER_SIZE) {
+            throw new \Exception("Frame too short");
+        }
+        return Packet::decode($frame);
+    }
+
+    /**
+     * Returns the next packet matching one of $types; unrelated packets
+     * (presence updates, chat traffic) are queued for later reads.
+     */
+    public function readPacketOfType(array $types, int $maxSkipped = 256): Packet
+    {
+        $skipped = [];
+        try {
+            while (count($skipped) <= $maxSkipped) {
+                $packet = $this->readPacket();
+                if (in_array($packet->header->msgType, $types, true)) {
+                    return $packet;
+                }
+                $skipped[] = $packet;
+            }
+            throw new \Exception("Too much unrelated traffic while waiting for packet");
+        } finally {
+            $this->inbox = array_merge($skipped, $this->inbox);
         }
     }
 }

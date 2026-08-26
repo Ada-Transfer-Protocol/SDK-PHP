@@ -13,10 +13,13 @@ class SecureSession
     private $peerSequence = 1;
     
     private $role; // 'client' or 'server'
+    // When true (protocol v2), the 45-byte frame header is bound as AEAD AAD.
+    private $bindAad = false;
 
-    public function __construct(string $role, string $sharedSecret)
+    public function __construct(string $role, string $sharedSecret, bool $bindAad = false)
     {
         $this->role = $role;
+        $this->bindAad = $bindAad;
         $keys = KeyDerivation::deriveSessionKeys($sharedSecret);
         
         $this->clientWriteKey = $keys['client_write'];
@@ -25,25 +28,30 @@ class SecureSession
         $this->serverIvRoot = $keys['server_iv'];
     }
 
-    public function encrypt(string $plaintext): array
+    /** The next sequence number this session will use for encrypt(). */
+    public function getMySequence(): int
+    {
+        return $this->mySequence;
+    }
+
+    public function encrypt(string $plaintext, string $aad = ''): array
     {
         $seq = $this->mySequence;
         $iv = $this->computeIv($seq, $this->role);
-        
+
         $key = ($this->role === 'client') ? $this->clientWriteKey : $this->serverWriteKey;
-        
-        // AES-256-GCM
-        // PHP openssl_encrypt returns base64 by default unless RAW option used.
-        // We need auth tag reference.
+
+        // AES-256-GCM. v2 binds the header as AAD (7th arg); v1 passes '' (empty).
+        $ad = ($this->bindAad ? $aad : '');
         $tag = "";
-        $ciphertext = openssl_encrypt($plaintext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag);
-        
+        $ciphertext = openssl_encrypt($plaintext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, $ad, 16);
+
         if ($ciphertext === false) {
             throw new \Exception("Encryption failed: " . openssl_error_string());
         }
 
         $this->mySequence++;
-        
+
         return [
             'ciphertext' => $ciphertext,
             'tag' => $tag,
@@ -51,17 +59,15 @@ class SecureSession
         ];
     }
 
-    public function decrypt(string $ciphertext, string $authTag, int $sequence): string
+    public function decrypt(string $ciphertext, string $authTag, int $sequence, string $aad = ''): string
     {
-        // Replay check logic?
-        // if ($sequence < $this->peerSequence) ...
-        
         $peerRole = ($this->role === 'client') ? 'server' : 'client';
         $iv = $this->computeIv($sequence, $peerRole);
-        
+
         $key = ($peerRole === 'client') ? $this->clientWriteKey : $this->serverWriteKey;
-        
-        $plaintext = openssl_decrypt($ciphertext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $authTag);
+
+        $ad = ($this->bindAad ? $aad : '');
+        $plaintext = openssl_decrypt($ciphertext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $authTag, $ad);
         
         if ($plaintext === false) {
              throw new \Exception("Decryption failed or auth tag invalid.");

@@ -1,0 +1,14 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with: { php-version: "8.2", extensions: "sodium, openssl" }
+      - run: composer validate
+      - run: for f in src/*.php src/Crypto/*.php *.php; do php -l "$f"; done
+      - run: composer install --no-interaction --no-progress
+      # v2 authenticated-handshake conformance (golden-vector replay; no server).
+      - run: php test/conformance_v2.php
