@@ -139,11 +139,26 @@ class Client
 
     public function authenticate(string $username, string $password): array
     {
+        return $this->doAuth(['username' => $username, 'password' => $password]);
+    }
+
+    /**
+     * Authenticate with a single credential string (token/session/API key)
+     * instead of username+password — for servers whose auth mode expects an
+     * auth_string (file-driver token, external webhook, etc.).
+     */
+    public function authenticateWithString(string $authString): array
+    {
+        return $this->doAuth(['auth_string' => $authString]);
+    }
+
+    private function doAuth(array $body): array
+    {
         if (!$this->cryptoSession) {
             throw new \Exception("No secure session (call connect() first)");
         }
 
-        $payload = json_encode(['username' => $username, 'password' => $password]);
+        $payload = json_encode($body);
         $this->sendEncryptedPacket(Protocol::MSG_AUTH_REQUEST, $payload);
 
         $response = $this->readPacketOfType([Protocol::MSG_AUTH_SUCCESS, Protocol::MSG_AUTH_FAILURE]);
